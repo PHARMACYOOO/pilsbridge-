@@ -1,0 +1,670 @@
+// Pilbridge — core data model (MVP).
+// Money is stored in kobo (₦1 = 100 kobo) as integers to avoid rounding errors.
+
+generator client {
+  provider            = "prisma-client"
+  output              = "../src/generated/prisma"
+  moduleFormat        = "esm"
+  importFileExtension = "js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  PATIENT
+  PHARMACIST // registered pharmacist: may review prescriptions and release quarantined stock
+  PHARMACY_STAFF // technician / counter staff: orders and inventory, no professional decisions
+  PLATFORM_ADMIN
+  RIDER // courier from a vetted logistics partner: sees parcels, never their contents
+}
+
+enum SocialProvider {
+  GOOGLE
+  APPLE
+}
+
+enum PharmacyStatus {
+  PENDING_VERIFICATION
+  VERIFIED
+  SUSPENDED
+}
+
+enum ProductClass {
+  OTC
+  POM // prescription-only medicine
+  DEVICE
+  CONTROLLED // never sold, delivered or transferred on the platform
+}
+
+enum BatchStatus {
+  SALEABLE
+  QUARANTINED
+  RECALLED
+  WRITTEN_OFF
+}
+
+enum OrderStatus {
+  PHARMACIST_REVIEW
+  ACCEPTED
+  PREPARING
+  READY
+  PICKED_UP
+  DELIVERED
+  REJECTED
+  CANCELLED
+}
+
+enum DeliveryStatus {
+  AWAITING_RIDER // offered to nearby online riders
+  ASSIGNED
+  PICKED_UP
+  DELIVERED // only with the recipient's drop-off code
+  FAILED // parcel goes back to the pharmacy, which can rebook
+  CANCELLED
+}
+
+enum DeliveryProvider {
+  PILBRIDGE_RIDERS // our rider app: riders from vetted partners take jobs themselves
+  COURIER // booked by operations with a courier company (dashboard/API), e.g. Chowdeck Relay
+}
+
+/// Why a delivery attempt failed — decides who bears its cost (see COST_BEARER in src/reports).
+enum FailureCause {
+  CUSTOMER_UNAVAILABLE
+  WRONG_ADDRESS
+  CUSTOMER_REFUSED
+  PHARMACY_DELAY
+  COURIER_FAULT
+  SAFETY // seal damaged, tampering, unsafe to complete
+  OTHER
+}
+
+enum CostBearer {
+  CUSTOMER
+  COURIER
+  PHARMACY
+  PLATFORM
+}
+
+enum InvoiceStatus {
+  OPEN
+  RECONCILED
+}
+
+enum IncidentType {
+  DAMAGED
+  TAMPERED // seal broken or parcel opened
+  LOST
+  TEMPERATURE_EXCURSION
+  WRONG_ITEM
+  OTHER
+}
+
+enum IncidentStatus {
+  OPEN
+  RESOLVED
+}
+
+enum PaymentStatus {
+  UNPAID
+  PAID
+  REFUND_DUE // paid, then cancelled: refund through Flutterwave
+}
+
+enum PrescriptionStatus {
+  PENDING
+  APPROVED
+  CLARIFICATION_REQUESTED
+  REJECTED
+}
+
+/// Who applied through the website's partner forms.
+enum PartnerKind {
+  PHARMACY
+  HOSPITAL
+  LOGISTICS
+}
+
+enum ApplicationStatus {
+  NEW
+  CONTACTED
+  APPROVED
+  DECLINED
+}
+
+/// Stock moving between two pharmacies. A pharmacist approves at each end.
+enum TransferStatus {
+  DRAFT // created by the sending pharmacy; not visible to anyone else
+  OFFERED // the sending pharmacist approved it: offered to one pharmacy, or to the network
+  ACCEPTED // the receiving pharmacist approved it: the stock is reserved out of the sending batch
+  IN_TRANSIT
+  RECEIVED // checked in at the receiving pharmacy
+  DECLINED // by the pharmacy it was offered to
+  CANCELLED // withdrawn before it left; reserved stock goes back to its batch
+}
+
+enum PayoutStatus {
+  SCHEDULED
+  PAID
+  VOID // cancelled before payment: its orders become payable again
+}
+
+enum DocumentKind {
+  PREMISES_LICENCE // verifying this also updates the pharmacy's licence number and expiry
+  SUPERINTENDENT_LICENCE
+  CAC_CERTIFICATE
+  COLD_CHAIN_CALIBRATION
+  INSURANCE
+  OTHER
+}
+
+enum DocumentStatus {
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+model User {
+  id                  String    @id @default(cuid())
+  phone               String?   @unique // E.164, e.g. +2348031234567. Optional: Google/Apple accounts may not have one
+  email               String?   @unique
+  firstName           String?
+  lastName            String?
+  role                Role      @default(PATIENT)
+  pharmacyId          String?
+  pharmacy            Pharmacy? @relation(fields: [pharmacyId], references: [id])
+  consentAt           DateTime? // consent to process health data (NDPA)
+  pcnRegNo            String? // pharmacists: Pharmacists Council of Nigeria registration number
+  notificationsSeenAt DateTime? // pharmacy portal: notifications after this are unread
+  disabledAt          DateTime? // can't sign in or use any session while set
+  disabledReason      String?
+  // Authenticator-app second factor (required for admins and pharmacists). The secret is encrypted.
+  totpSecret          String? // set when setup starts; confirmed by the first valid code
+  totpEnabledAt       DateTime?
+  totpLastStep        Int? // the last 30-second step accepted, so a code can't be used twice
+  mfaFailures         Int       @default(0)
+  mfaLockedUntil      DateTime?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  socialIdentities SocialIdentity[]
+  sessions         Session[]
+  recoveryCodes    MfaRecoveryCode[]
+  riderProfile     RiderProfile?
+  riderDeliveries  Delivery[]        @relation("RiderDeliveries")
+  orders           Order[]           @relation("PatientOrders")
+  prescriptions    Prescription[]    @relation("PatientPrescriptions")
+  reviews          Prescription[]    @relation("ReviewedPrescriptions")
+  auditEntries     AuditLog[]
+
+  @@index([pharmacyId])
+}
+
+/// A Google or Apple account that signs in to a user.
+model SocialIdentity {
+  id        String         @id @default(cuid())
+  provider  SocialProvider
+  subject   String // the provider's stable user id ("sub" claim)
+  email     String?
+  userId    String
+  user      User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime       @default(now())
+
+  @@unique([provider, subject])
+  @@index([userId])
+}
+
+model OtpChallenge {
+  id         String    @id @default(cuid())
+  phone      String
+  codeHash   String
+  expiresAt  DateTime
+  attempts   Int       @default(0)
+  consumedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([phone, createdAt])
+}
+
+model Pharmacy {
+  id                  String         @id @default(cuid())
+  slug                String         @unique
+  name                String
+  area                String
+  address             String
+  premisesLicenceNo   String
+  licenceExpiresAt    DateTime
+  status              PharmacyStatus @default(PENDING_VERIFICATION)
+  coldChain           Boolean        @default(false)
+  // Approximate location, for matching orders to nearby pharmacies and riders.
+  lat                 Float?
+  lng                 Float?
+  phone               String? // counter phone couriers call at pickup (E.164)
+  email               String?
+  superintendentName  String?
+  verifiedAt          DateTime?
+  suspendedAt         DateTime?
+  suspendedReason     String?
+  licenceReminderDays Int? // the last licence-expiry reminder sent (60, 30 or 7 days before); reset when the expiry changes
+  // Delivery hours (Lagos time) and the delivery areas served. No areas listed = every area.
+  openDays            Int[]          @default([]) // ISO weekdays, 1 = Monday
+  opensAt             String? // "08:00"
+  lastOrderAt         String? // "19:30"
+  coverageAreas       String[]       @default([]) // keys from src/delivery/areas.ts
+  // Settlement account. A change needs admin verification, then a 48-hour hold, before any payout.
+  bankName            String?
+  bankAccountName     String?
+  bankAccountNumber   String?
+  bankUpdatedAt       DateTime?
+  bankVerifiedAt      DateTime?
+  bankVerifiedById    String?
+  createdAt           DateTime       @default(now())
+
+  staff        User[]
+  batches      Batch[]
+  orders       Order[]
+  transfersOut Transfer[]           @relation("TransfersOut")
+  transfersIn  Transfer[]           @relation("TransfersIn")
+  payouts      Payout[]
+  documents    ComplianceDocument[]
+}
+
+model Product {
+  id              String       @id @default(cuid())
+  slug            String       @unique
+  name            String
+  genericName     String
+  form            String
+  strength        String?
+  packDescription String
+  unitsPerPack    Int          @default(1)
+  manufacturer    String
+  nafdacRegNo     String?
+  category        String
+  classification  ProductClass
+  coldChain       Boolean      @default(false)
+  storage         String
+  uses            String? // what it's commonly used for: shown to patients and searchable (e.g. "typhoid")
+  deliveryAllowed Boolean      @default(true) // false: pharmacy pickup only, set by the compliance lead
+
+  batches    Batch[]
+  orderItems OrderItem[]
+
+  @@index([category])
+}
+
+model Batch {
+  id               String      @id @default(cuid())
+  pharmacyId       String
+  pharmacy         Pharmacy    @relation(fields: [pharmacyId], references: [id])
+  productId        String
+  product          Product     @relation(fields: [productId], references: [id])
+  batchNumber      String
+  expiresAt        DateTime
+  quantity         Int // units on hand, in packs
+  priceKobo        Int // selling price per pack
+  location         String?
+  status           BatchStatus @default(SALEABLE)
+  quarantineReason String?
+  receivedAt       DateTime    @default(now())
+
+  allocations OrderItem[]
+  transfers   Transfer[]
+
+  @@unique([pharmacyId, productId, batchNumber])
+  @@index([pharmacyId, productId, status, expiresAt]) // FEFO lookups
+}
+
+model Order {
+  id              String        @id @default(cuid())
+  code            String        @unique // human-friendly, e.g. PB-118903
+  patientId       String
+  patient         User          @relation("PatientOrders", fields: [patientId], references: [id])
+  pharmacyId      String
+  pharmacy        Pharmacy      @relation(fields: [pharmacyId], references: [id])
+  status          OrderStatus
+  deliveryAddress String
+  deliveryArea    String? // key from the delivery areas list (src/delivery/areas.ts)
+  dropoffLat      Float? // exact drop-off pinned by the customer (needed for courier API bookings)
+  dropoffLng      Float?
+  etaMinutes      Int? // promised delivery time from payment, estimated at checkout
+  lateTextAt      DateTime? // when the customer was texted that it's running late (once per order)
+  subtotalKobo    Int
+  deliveryKobo    Int
+  serviceKobo     Int
+  totalKobo       Int
+  statusNote      String?
+  // Paid before the pharmacy prepares it. Prescription orders become payable once a pharmacist approves.
+  paymentStatus   PaymentStatus @default(UNPAID)
+  paidAt          DateTime?
+  paymentTxId     String?       @unique // Flutterwave transaction id (or "demo-…" in development)
+  preparingAt     DateTime? // pharmacy started packing
+  readyAt         DateTime? // first marked ready for pickup
+  payoutId        String? // the pharmacy payout that settled this order
+  payout          Payout?       @relation(fields: [payoutId], references: [id])
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  items        OrderItem[]
+  prescription Prescription?
+  deliveries   Delivery[]
+  incidents    Incident[]
+
+  @@index([pharmacyId, status])
+  @@index([patientId, createdAt])
+  @@index([payoutId])
+}
+
+model OrderItem {
+  id            String  @id @default(cuid())
+  orderId       String
+  order         Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId     String
+  product       Product @relation(fields: [productId], references: [id])
+  quantity      Int // packs
+  unitPriceKobo Int
+  batchId       String? // set when stock is allocated (FEFO) at the PREPARING step
+  batch         Batch?  @relation(fields: [batchId], references: [id])
+}
+
+model Prescription {
+  id             String             @id @default(cuid())
+  code           String             @unique // e.g. RX-20931
+  patientId      String
+  patient        User               @relation("PatientPrescriptions", fields: [patientId], references: [id])
+  orderId        String?            @unique
+  order          Order?             @relation(fields: [orderId], references: [id])
+  imageKey       String? // object-storage key; never exposed to logistics partners
+  prescriberName String?
+  status         PrescriptionStatus @default(PENDING)
+  reviewedById   String?
+  reviewedBy     User?              @relation("ReviewedPrescriptions", fields: [reviewedById], references: [id])
+  reviewedAt     DateTime?
+  decisionNote   String?
+  createdAt      DateTime           @default(now())
+
+  @@index([status])
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  actor      User?    @relation(fields: [actorId], references: [id])
+  action     String // e.g. prescription.approved, batch.quarantined
+  entityType String
+  entityId   String
+  metadata   Json?
+  createdAt  DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([createdAt])
+}
+
+/// A courier working for a vetted logistics partner.
+model RiderProfile {
+  userId      String    @id
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  partner     String // logistics company
+  coldChain   Boolean   @default(false) // carries a validated cold box
+  active      Boolean   @default(true) // paused riders can't go online or take jobs
+  area        String? // delivery area key while online
+  onlineSince DateTime?
+}
+
+/// One attempt to get an order from the pharmacy to the patient. A failed attempt can be rebooked.
+model Delivery {
+  id               String           @id @default(cuid())
+  code             String           @unique // e.g. DL-9F2C41AA; also the seal number on the parcel
+  orderId          String
+  order            Order            @relation(fields: [orderId], references: [id])
+  riderId          String?
+  rider            User?            @relation("RiderDeliveries", fields: [riderId], references: [id])
+  provider         DeliveryProvider @default(PILBRIDGE_RIDERS)
+  courierId        String?
+  courier          Courier?         @relation(fields: [courierId], references: [id])
+  providerRef      String? // the courier's own booking reference
+  feeKobo          Int? // what the courier charges us, for reconciliation
+  trackingUrl      String?
+  handedOverById   String? // pharmacy staff who checked the seal code and handed the parcel over
+  proof            String? // how delivery was confirmed: "customer code" or the courier's proof-of-delivery reference
+  providerStatus   String? // the courier's own latest status, as reported by its API
+  providerStatusAt DateTime?
+  bookingError     String? // why automatic courier booking last failed
+  status           DeliveryStatus   @default(AWAITING_RIDER)
+  coldChain        Boolean          @default(false)
+  dropoffCode      String // 4 digits, shown only to the patient
+  codeAttempts     Int              @default(0)
+  createdAt        DateTime         @default(now())
+  assignedAt       DateTime?
+  pickedUpAt       DateTime?
+  deliveredAt      DateTime?
+  failedAt         DateTime?
+  failReason       String?
+  failureCause     FailureCause?
+  costBearer       CostBearer? // who pays for this failed attempt
+  incidents        Incident[]
+  staleAlertAt     DateTime? // when ops were told nobody had taken it (once per job)
+
+  @@index([status])
+  @@index([riderId, status])
+  @@index([orderId])
+}
+
+/// A courier company we book deliveries with, and what it has agreed in writing to carry.
+model Courier {
+  id                  String           @id @default(cuid())
+  name                String           @unique
+  contact             String? // dispatcher phone or email
+  acceptsPrescription Boolean          @default(false) // written acceptance of prescription-only parcels
+  acceptsColdChain    Boolean          @default(false) // validated 2–8 °C capability, with evidence
+  approvalNote        String? // where the written approval is, e.g. "Email from Relay ops, 12 Oct 2026"
+  active              Boolean          @default(true)
+  api                 String? // connected API adapter, e.g. "CHOWDECK_RELAY"; null = booked by hand on their dashboard
+  priority            Int              @default(100) // lower is tried first for automatic booking and quotes
+  createdAt           DateTime         @default(now())
+  deliveries          Delivery[]
+  invoices            CourierInvoice[]
+}
+
+/// Something went wrong with a parcel: damaged, tampered, lost, temperature, wrong item.
+model Incident {
+  id           String         @id @default(cuid())
+  code         String         @unique // e.g. INC-4F2A
+  orderId      String
+  order        Order          @relation(fields: [orderId], references: [id])
+  deliveryId   String?
+  delivery     Delivery?      @relation(fields: [deliveryId], references: [id])
+  type         IncidentType
+  description  String
+  reportedById String
+  reporterRole Role
+  status       IncidentStatus @default(OPEN)
+  resolution   String?
+  resolvedById String?
+  createdAt    DateTime       @default(now())
+  resolvedAt   DateTime?
+
+  @@index([status, createdAt])
+  @@index([orderId])
+}
+
+/// A delivery price quoted at checkout from a courier's API. Orders reference it so the price can't be altered.
+model DeliveryQuote {
+  id             String   @id @default(cuid())
+  pharmacyId     String
+  courierId      String?
+  lat            Float
+  lng            Float
+  courierFeeKobo Int? // what the courier quoted us
+  priceKobo      Int // what the customer pays for delivery
+  expiresAt      DateTime
+  createdAt      DateTime @default(now())
+
+  @@index([createdAt])
+}
+
+/// A courier's invoice, entered by operations and checked line by line against our delivery records.
+model CourierInvoice {
+  id             String               @id @default(cuid())
+  courierId      String
+  courier        Courier              @relation(fields: [courierId], references: [id])
+  number         String // the courier's invoice number
+  periodStart    DateTime
+  periodEnd      DateTime
+  totalKobo      Int
+  status         InvoiceStatus        @default(OPEN)
+  note           String?
+  createdById    String
+  createdAt      DateTime             @default(now())
+  reconciledAt   DateTime?
+  reconciledById String?
+  lines          CourierInvoiceLine[]
+
+  @@unique([courierId, number])
+}
+
+model CourierInvoiceLine {
+  id          String         @id @default(cuid())
+  invoiceId   String
+  invoice     CourierInvoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  providerRef String // the courier's delivery reference
+  amountKobo  Int
+
+  @@index([invoiceId])
+}
+
+/// An application from the website's partner forms (pharmacies, hospitals, logistics companies).
+/// Nothing is created or activated from it automatically: operations verify the credentials first.
+model PartnerApplication {
+  id           String            @id @default(cuid())
+  code         String            @unique // e.g. APP-48213
+  kind         PartnerKind
+  organisation String
+  contactName  String
+  email        String
+  phone        String // E.164
+  details      Json // the rest of the form, as submitted
+  status       ApplicationStatus @default(NEW)
+  note         String?
+  reviewedById String?
+  reviewedAt   DateTime?
+  pharmacyId   String? // the pharmacy record created from it, if any
+  createdAt    DateTime          @default(now())
+
+  @@index([status, createdAt])
+}
+
+/// Stock sent from one pharmacy's batch to another pharmacy.
+model Transfer {
+  id              String         @id @default(cuid())
+  code            String         @unique // e.g. TR-41820
+  fromPharmacyId  String
+  fromPharmacy    Pharmacy       @relation("TransfersOut", fields: [fromPharmacyId], references: [id])
+  toPharmacyId    String? // null while offered to the whole network
+  toPharmacy      Pharmacy?      @relation("TransfersIn", fields: [toPharmacyId], references: [id])
+  batchId         String
+  batch           Batch          @relation(fields: [batchId], references: [id])
+  quantity        Int // packs
+  status          TransferStatus @default(DRAFT)
+  note            String?
+  createdById     String
+  publishedById   String? // sending pharmacist's approval
+  publishedAt     DateTime?
+  acceptedById    String? // receiving pharmacist's approval
+  acceptedAt      DateTime?
+  dispatchedById  String?
+  dispatchedAt    DateTime?
+  receivedById    String?
+  receivedAt      DateTime?
+  receivedBatchId String? // the batch it was checked in to at the receiving pharmacy
+  closedById      String? // declined or cancelled by
+  closedAt        DateTime?
+  closeReason     String?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  @@index([fromPharmacyId, status])
+  @@index([toPharmacyId, status])
+  @@index([status])
+}
+
+/// Money owed to a pharmacy for its delivered, paid orders: goods subtotal less the platform commission.
+model Payout {
+  id                String       @id @default(cuid())
+  code              String       @unique // e.g. PO-20931
+  pharmacyId        String
+  pharmacy          Pharmacy     @relation(fields: [pharmacyId], references: [id])
+  periodStart       DateTime // earliest delivery included
+  periodEnd         DateTime // deliveries before this are included
+  orderCount        Int
+  grossKobo         Int // goods subtotal of the orders
+  feesKobo          Int // platform commission
+  netKobo           Int
+  status            PayoutStatus @default(SCHEDULED)
+  // The account actually paid, recorded at payment time.
+  bankName          String?
+  bankAccountName   String?
+  bankAccountNumber String?
+  reference         String? // bank transfer reference
+  paidAt            DateTime?
+  paidById          String?
+  createdById       String
+  createdAt         DateTime     @default(now())
+  orders            Order[]
+
+  @@index([pharmacyId, createdAt])
+  @@index([status])
+}
+
+/// A licence or certificate a pharmacy uploads for operations to verify.
+model ComplianceDocument {
+  id           String         @id @default(cuid())
+  pharmacyId   String
+  pharmacy     Pharmacy       @relation(fields: [pharmacyId], references: [id])
+  kind         DocumentKind
+  reference    String // licence / certificate number
+  issuer       String
+  expiresAt    DateTime? // null: doesn't expire (e.g. CAC certificate)
+  fileKey      String // storage key; served only to the pharmacy's staff and admins
+  fileName     String?
+  status       DocumentStatus @default(PENDING)
+  reviewNote   String?
+  reviewedById String?
+  reviewedAt   DateTime?
+  reminderDays Int? // the last expiry reminder sent (60, 30 or 7 days before)
+  uploadedById String
+  createdAt    DateTime       @default(now())
+
+  @@index([pharmacyId, kind, createdAt])
+  @@index([status])
+}
+
+/// A signed-in device. Every access token names its session, so it can be ended from the server.
+model Session {
+  id            String    @id @default(cuid())
+  userId        String
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  mfa           Boolean   @default(false) // the second factor was passed for this session
+  userAgent     String?
+  ip            String?
+  createdAt     DateTime  @default(now())
+  expiresAt     DateTime
+  revokedAt     DateTime?
+  revokedReason String?
+
+  @@index([userId, revokedAt])
+}
+
+/// One-time codes for signing in when the authenticator app is lost. Only HMACs are stored.
+model MfaRecoveryCode {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  codeHash  String
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+}
